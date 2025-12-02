@@ -100,57 +100,113 @@ app.post('/api/games/populate', (req, res) => {
   };
 
   // fully flatten nested arrays of objects
-      const flattenArrays = (arr) => {
-        if (!Array.isArray(arr)) return [];
-        let result = [];
-        for (let item of arr) {
-          if (Array.isArray(item)) {
-            result = result.concat(flattenArrays(item));
-          } else if (typeof item === 'object' && item !== null) {
-            result.push(item);
-          }
-        }
-        return result;
+  const flattenArrays = (arr) => {
+    if (!Array.isArray(arr)) return [];
+    let result = [];
+    for (let item of arr) {
+      if (Array.isArray(item)) {
+        result = result.concat(flattenArrays(item));
+      } else if (typeof item === 'object' && item !== null) {
+        result.push(item);
+      }
+    }
+    return result;
+  };
+
+  const scoreFromItem = (item) => {
+    const rating = item.rating || 0;
+    const ratingCount = item.rating_count || 0;
+    const r = parseFloat(rating) || 0;
+    const rc = parseFloat(ratingCount) || 0;
+    return r * rc;
+  };
+
+  const normalizeItems = (raw, platformLabel) => {
+    const mapped = flattenArrays(raw).map((item) => {
+      const storeId = item.app_id || '';
+      const name = item.humanized_name || '';
+      const publisherId = String(item.publisher_id || '');
+      const bundleId = item.bundle_id || '';
+      const appVersion = item.version || '';
+      const isPublished = typeof item.isPublished === 'boolean' ? item.isPublished : true;
+      const score = scoreFromItem(item);
+      return {
+        db: { publisherId, name, platform: platformLabel, storeId: String(storeId), bundleId, appVersion, isPublished },
+        score,
       };
+    }).filter(x => x.db.storeId && x.db.storeId.trim() !== '');
+    return mapped;
+  };
 
-      const mapToModel = (item) => ({
-        publisherId: item.publisher_id ? String(item.publisher_id) : (item.publisherId ? String(item.publisherId) : ''),
-        name: item.name || item.humanized_name || '',
-        platform: item.os || item.platform || '',
-        storeId: item.id || item.app_id || item.appId || '',
-        bundleId: item.appId || item.bundleId || item.app_id || item.id || '',
-        appVersion: item.appVersion || item.version || '',
-        isPublished: typeof item.isPublished === 'boolean' ? item.isPublished : true,
-      });
+  return Promise.allSettled([fetchWithRetry(iosUrl), fetchWithRetry(androidUrl)])
+    .then(async (results) => {
+      const successes = [];
+      const warnings = [];
 
-      // Flatten both S3 responses
-      const iosNormalized = flattenArrays(iosResponse.data);
-      const androidNormalized = flattenArrays(androidResponse.data);
+      if (results[0].status === 'fulfilled') {
+        successes.push({ platform: 'ios', data: results[0].value });
+      } else {
+        warnings.push({ platform: 'ios', error: String(results[0].reason) });
+      }
 
-      // Map to model shape
-      const iosGames = iosNormalized.map(mapToModel);
-      const androidGames = androidNormalized.map(mapToModel);
+      if (results[1].status === 'fulfilled') {
+        successes.push({ platform: 'android', data: results[1].value });
+      } else {
+        warnings.push({ platform: 'android', error: String(results[1].reason) });
+      }
 
-      const topGames = [...iosGames, ...androidGames]
-        .sort((a, b) => 
-          ((b.rating || 0) * (b.ratingCount || 0)) - 
-          ((a.rating || 0) * (a.ratingCount || 0))
-        )
+      if (successes.length === 0) {
+        return res.status(502).send({ message: 'Failed to fetch both iOS and Android data', warnings });
+      }
+
+      // Normalize all items from all platforms into one combined list
+      let allNormalized = [];
+      for (const s of successes) {
+        allNormalized = allNormalized.concat(normalizeItems(s.data, s.platform));
+      }
+
+      // Sort by score descending and pick top 100 overall (regardless of platform)
+      const top100 = allNormalized
+        .sort((a, b) => b.score - a.score)
         .slice(0, 100);
 
-      // Prevent duplicates: only insert games where storeId+platform doesn't already exist
-      return db.Game.findAll({ attributes: ['storeId', 'platform'] })
-        .then((existing) => {
-          const existingSet = new Set(existing.map(g => `${g.storeId}|${g.platform}`));
-          const toInsert = topGames.filter(g => g.storeId && g.storeId.toString().trim() !== '' && !existingSet.has(`${g.storeId}|${g.platform}`));
-          return Promise.all(toInsert.map(g => db.Game.create(g))).then(created => ({ created: created.length, skipped: topGames.length - created.length }));
-        });
-    }).then((result) => {
-      res.send({ message: `Population complete. Created: ${result.created}, Skipped (duplicates): ${result.skipped}` });
+      // Fetch existing storeId+platform to avoid duplicates
+      const existing = await db.Game.findAll({ attributes: ['storeId', 'platform'] });
+      const existingSet = new Set(existing.map(g => `${g.storeId}|${g.platform}`));
+
+      // Build final insert list (db objects only), skipping duplicates
+      let toInsert = [];
+      for (const item of top100) {
+        const key = `${item.db.storeId}|${item.db.platform}`;
+        if (!existingSet.has(key)) {
+          toInsert.push(item.db);
+          existingSet.add(key);
+        }
+      }
+
+      // Insert into DB
+      const created = [];
+      for (const g of toInsert) {
+        try {
+          // create each record; avoid failing entire batch on single error
+          // eslint-disable-next-line no-await-in-loop
+          const c = await db.Game.create(g);
+          created.push(c);
+        } catch (err) {
+          console.log('Warning: failed to create game', g.storeId, g.platform, String(err));
+        }
+      }
+
+      return res.send({
+        message: 'Population complete',
+        created: created.length,
+        skipped: top100.length - created.length,
+        warnings,
+      });
     })
     .catch((err) => {
-      console.log('***Error populating games', JSON.stringify(err));
-      res.status(400).send(err);
+      console.log('***Error populating games', String(err));
+      res.status(500).send({ error: String(err) });
     });
 });
 
