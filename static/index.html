@@ -25,6 +25,11 @@
       <search-games title="Search Games" @search-games-db="searchGames" :search="search" />
     </div>
   </section>
+  <section class="section section-container" style="padding-bottom: 10px;">
+    <div class="box">
+      <button class="button is-info" @click="populateGames">Populate Database</button>
+    </div>
+  </section>
   <section class="section section-container" style="padding-top: 24px; padding-bottom: 5px;">
     <h2 class="title">Games</h2>
     <game v-for="(game, index) in games"
@@ -254,6 +259,20 @@
         return axios.post(`${this.apiURL}/search`, search)
           .then((response) => {
             this.games = response.data
+          })
+      },
+      populateGames () {
+        return axios.post(`${this.apiURL}/populate`)
+          .then((response) => {
+            console.log('Populate response:', response.data)
+            // Refresh the games list after populating
+            return axios.get(this.apiURL)
+              .then((refreshResponse) => {
+                this.games = refreshResponse.data
+              })
+          })
+          .catch((err) => {
+            console.log('Error populating games', err)
           })
       }
     },
