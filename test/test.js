@@ -131,3 +131,146 @@ describe('GET /api/games', function () {
     });
 });
 
+/**
+ * Testing search games endpoint
+ */
+describe('POST /api/games/search', function () {
+    // First create a test game to search for
+    before(function (done) {
+        const testData = {
+            publisherId: "999",
+            name: "SearchTest Game",
+            platform: "ios",
+            storeId: "9999",
+            bundleId: "search.test.bundle",
+            appVersion: "1.0.0",
+            isPublished: true
+        };
+        request(app)
+            .post('/api/games')
+            .send(testData)
+            .end((err) => {
+                if (err) return done(err);
+                done();
+            });
+    });
+
+    it('should search by name and return matching games', function (done) {
+        request(app)
+            .post('/api/games/search')
+            .send({ name: 'SearchTest', platform: '' })
+            .set('Accept', 'application/json')
+            .expect('Content-Type', /json/)
+            .expect(200)
+            .end((err, result) => {
+                if (err) return done(err);
+                assert(Array.isArray(result.body));
+                assert(result.body.length > 0);
+                assert.strictEqual(result.body[0].name, 'SearchTest Game');
+                done();
+            });
+    });
+
+    it('should search by platform and return matching games', function (done) {
+        request(app)
+            .post('/api/games/search')
+            .send({ name: '', platform: 'ios' })
+            .set('Accept', 'application/json')
+            .expect('Content-Type', /json/)
+            .expect(200)
+            .end((err, result) => {
+                if (err) return done(err);
+                assert(Array.isArray(result.body));
+                assert(result.body.length > 0);
+                assert.strictEqual(result.body[0].platform, 'ios');
+                done();
+            });
+    });
+
+    it('should search by both name and platform', function (done) {
+        request(app)
+            .post('/api/games/search')
+            .send({ name: 'SearchTest', platform: 'ios' })
+            .set('Accept', 'application/json')
+            .expect('Content-Type', /json/)
+            .expect(200)
+            .end((err, result) => {
+                if (err) return done(err);
+                assert(Array.isArray(result.body));
+                assert(result.body.length > 0);
+                assert.strictEqual(result.body[0].name, 'SearchTest Game');
+                assert.strictEqual(result.body[0].platform, 'ios');
+                done();
+            });
+    });
+
+    it('should return all games when no filters provided', function (done) {
+        request(app)
+            .post('/api/games/search')
+            .send({ name: '', platform: '' })
+            .set('Accept', 'application/json')
+            .expect('Content-Type', /json/)
+            .expect(200)
+            .end((err, result) => {
+                if (err) return done(err);
+                assert(Array.isArray(result.body));
+                assert(result.body.length > 0);
+                done();
+            });
+    });
+
+    it('should return empty array for non-matching search', function (done) {
+        request(app)
+            .post('/api/games/search')
+            .send({ name: 'NonExistentGame', platform: '' })
+            .set('Accept', 'application/json')
+            .expect('Content-Type', /json/)
+            .expect(200)
+            .end((err, result) => {
+                if (err) return done(err);
+                assert(Array.isArray(result.body));
+                assert.strictEqual(result.body.length, 0);
+                done();
+            });
+    });
+});
+
+/**
+ * Testing populate games endpoint
+ */
+describe('POST /api/games/populate', function () {
+    it('should populate games from S3 and return summary', function (done) {
+        this.timeout(15000); // Allow 15 seconds for S3 fetch and DB inserts
+        request(app)
+            .post('/api/games/populate')
+            .set('Accept', 'application/json')
+            .expect('Content-Type', /json/)
+            .expect(200)
+            .end((err, result) => {
+                if (err) return done(err);
+                assert(result.body.message);
+                assert.strictEqual(result.body.message, 'Population complete');
+                assert(typeof result.body.created === 'number');
+                assert(typeof result.body.skipped === 'number');
+                assert(result.body.created > 0);
+                done();
+            });
+    });
+
+    it('should skip duplicates on second populate call', function (done) {
+        this.timeout(15000);
+        request(app)
+            .post('/api/games/populate')
+            .set('Accept', 'application/json')
+            .expect('Content-Type', /json/)
+            .expect(200)
+            .end((err, result) => {
+                if (err) return done(err);
+                // Second call should create 0 new games (all are duplicates)
+                assert.strictEqual(result.body.created, 0);
+                // Skipped should be 100 (top 100 apps)
+                assert.strictEqual(result.body.skipped, 100);
+                done();
+            });
+    });
+});
