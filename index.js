@@ -84,17 +84,22 @@ app.post('/api/games/populate', (req, res) => {
   const iosUrl = 'https://wizz-technical-test-dev.s3.eu-west-3.amazonaws.com/ios.top100.json';
   const androidUrl = 'https://wizz-technical-test-dev.s3.eu-west-3.amazonaws.com/android.top100.json';
 
-  // Step 1: Clear existing games from the database
-  return db.Game.destroy({ truncate: true })
-    .then(() => {
-      // Step 2: Fetch both files from S3
-      return Promise.all([
-        axios.get(iosUrl),
-        axios.get(androidUrl),
-      ]);
-    })
-    .then(([iosResponse, androidResponse]) => {
-      // The files are deeply nested arrays — flatten them completely
+  const fetchWithRetry = async (url, attempts = 3, delayMs = 500) => {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const resp = await axios.get(url, { timeout: 5000 });
+        return resp.data;
+      } catch (err) {
+        lastErr = err;
+        // exponential backoff
+        await new Promise(r => setTimeout(r, delayMs * Math.pow(2, i)));
+      }
+    }
+    throw lastErr;
+  };
+
+  // fully flatten nested arrays of objects
       const flattenArrays = (arr) => {
         if (!Array.isArray(arr)) return [];
         let result = [];
