@@ -52,22 +52,31 @@ app.put('/api/games/:id', (req, res) => {
 });
 
 app.post('/api/games/search', (req, res) => {
-  // Extract search parameters from the request body
-  const { name, platform } = req.body;
+  // Validate input: name and platform should be strings
+  const { name = '', platform = '' } = req.body;
   
-  // Build a filter object - this is how we construct database queries in Sequelize
+  // Sanitize inputs by trimming whitespace
+  const sanitizedName = String(name || '').trim();
+  const sanitizedPlatform = String(platform || '').trim();
+  
+  // Validate input lengths to prevent abuse
+  if (sanitizedName.length > 255 || sanitizedPlatform.length > 100) {
+    return res.status(400).send({ error: 'Search parameters exceed maximum length' });
+  }
+  
+  // Build a filter object - Sequelize parameterizes queries automatically preventing SQL injection
   const where = {};
   
   // If a name was provided, add a filter for partial name matching
   // sequelize.Op.like allows us to search for partial matches (case-insensitive)
-  if (name && name.trim() !== '') {
+  if (sanitizedName !== '') {
     const { Op } = require('sequelize');
-    where.name = { [Op.like]: `%${name}%` };
+    where.name = { [Op.like]: `%${sanitizedName}%` };
   }
   
   // If a platform was provided and it's not empty, add an exact match filter
-  if (platform && platform.trim() !== '') {
-    where.platform = platform;
+  if (sanitizedPlatform !== '') {
+    where.platform = sanitizedPlatform;
   }
   
   // Query the database with our filters
@@ -75,15 +84,27 @@ app.post('/api/games/search', (req, res) => {
     .then(games => res.send(games))
     .catch((err) => {
       console.log('There was an error searching games', JSON.stringify(err));
-      return res.status(400).send(err);
+      return res.status(500).send({ error: 'Failed to search games' });
     });
 });
 
+// POST /api/games/populate
+// Purpose: Fetch top-rated apps from S3 (iOS and Android) and populate the database
+// Features:
+//   - Fetches from 2 S3 JSON files (ios.top100.json and android.top100.json)
+//   - Retries failed requests with exponential backoff to handle transient failures
+//   - Flattens nested JSON arrays and normalizes fields to match the Game model
+//   - Scores games by popularity (rating * ratingCount) and selects top 100 overall
+//   - Deduplicates by storeId + platform to avoid re-inserting existing games
+//   - Handles partial failures gracefully (if one platform fails, continues with the other)
+//   - Returns summary of created/skipped records and any warnings
 app.post('/api/games/populate', (req, res) => {
   const axios = require('axios');
   const iosUrl = 'https://wizz-technical-test-dev.s3.eu-west-3.amazonaws.com/ios.top100.json';
   const androidUrl = 'https://wizz-technical-test-dev.s3.eu-west-3.amazonaws.com/android.top100.json';
 
+  // Retry logic with exponential backoff for handling transient network failures
+  // Max 3 attempts with 500ms base delay, doubling each attempt (500ms, 1s, 2s)
   const fetchWithRetry = async (url, attempts = 3, delayMs = 500) => {
     let lastErr;
     for (let i = 0; i < attempts; i++) {
@@ -100,6 +121,8 @@ app.post('/api/games/populate', (req, res) => {
   };
 
   // fully flatten nested arrays of objects
+  // The S3 JSON files contain deeply nested arrays; this recursively unwraps them
+  // to extract individual game objects at all nesting levels
   const flattenArrays = (arr) => {
     if (!Array.isArray(arr)) return [];
     let result = [];
@@ -113,6 +136,9 @@ app.post('/api/games/populate', (req, res) => {
     return result;
   };
 
+  // Calculate popularity score: rating * ratingCount
+  // Used to rank apps and select the top 100 most popular ones
+  // Handles multiple field name variations between iOS and Android data sources
   const scoreFromItem = (item) => {
     const rating = item.rating || 0;
     const ratingCount = item.rating_count || 0;
@@ -121,6 +147,9 @@ app.post('/api/games/populate', (req, res) => {
     return r * rc;
   };
 
+  // Normalize raw S3 items to match the Game database model
+  // Maps field names from S3 JSON to our database schema, with fallbacks for variations
+  // Calculates popularity score for ranking
   const normalizeItems = (raw, platformLabel) => {
     const mapped = flattenArrays(raw).map((item) => {
       const storeId = item.app_id || '';
@@ -140,6 +169,8 @@ app.post('/api/games/populate', (req, res) => {
 
   return Promise.allSettled([fetchWithRetry(iosUrl), fetchWithRetry(androidUrl)])
     .then(async (results) => {
+      // Process both fetches independently - even if one fails, continue with the other
+      // This ensures partial data import if only one platform is available
       const successes = [];
       const warnings = [];
 
@@ -159,22 +190,25 @@ app.post('/api/games/populate', (req, res) => {
         return res.status(502).send({ message: 'Failed to fetch both iOS and Android data', warnings });
       }
 
-      // Normalize all items from all platforms into one combined list
+      // Combine all normalized items from all platforms into one list
       let allNormalized = [];
       for (const s of successes) {
         allNormalized = allNormalized.concat(normalizeItems(s.data, s.platform));
       }
 
-      // Sort by score descending and pick top 100 overall (regardless of platform)
+      // Sort by score descending and pick top 100 overall
+      // This ensures we get the 100 most popular apps across both stores
       const top100 = allNormalized
         .sort((a, b) => b.score - a.score)
         .slice(0, 100);
 
-      // Fetch existing storeId+platform to avoid duplicates
+      // Fetch existing storeId+platform combinations to avoid duplicates
+      // This allows the endpoint to be called multiple times without creating duplicates
       const existing = await db.Game.findAll({ attributes: ['storeId', 'platform'] });
       const existingSet = new Set(existing.map(g => `${g.storeId}|${g.platform}`));
 
-      // Build final insert list (db objects only), skipping duplicates
+      // Build final insert list, skipping duplicates
+      // Only insert games that don't already exist in the database
       let toInsert = [];
       for (const item of top100) {
         const key = `${item.db.storeId}|${item.db.platform}`;
@@ -184,7 +218,8 @@ app.post('/api/games/populate', (req, res) => {
         }
       }
 
-      // Insert into DB
+      // Insert into DB with graceful error handling
+      // If a single game fails to insert, log a warning but continue with others
       const created = [];
       for (const g of toInsert) {
         try {
